@@ -1,0 +1,13 @@
+node_modules/
+.expo/
+dist/
+.env
+.env.*
+!.env.example
+
+backend/.venv/
+__pycache__/
+.pytest_cache/
+backend/uploads/
+*.pyc
+*service-account*.json

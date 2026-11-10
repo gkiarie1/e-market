@@ -1,0 +1,33 @@
+rules_version = '2';
+service cloud.firestore {
+ match /databases/{database}/documents {
+  function member() {
+   return request.auth != null && request.auth.token.marketplace == true
+    && request.auth.token.chatExpiresAt * 1000 > request.time.toMillis();
+  }
+  match /conversations/{id} {
+   allow read: if member() && request.auth.uid in resource.data.participants;
+   // Only FastAPI's Admin SDK can create membership or change participant names.
+   allow write: if false;
+  }
+  match /messages/{id} {
+   allow read: if member() && request.auth.uid in resource.data.participants;
+   allow create: if member()
+    && request.resource.data.keys().hasOnly(['id','conversationId','senderId','recipientId','participants','text','sentAt'])
+    && request.resource.data.id == id
+    && request.resource.data.senderId == request.auth.uid
+    && request.resource.data.recipientId != request.auth.uid
+    && request.resource.data.participants is list
+    && request.resource.data.participants.size() == 2
+    && request.auth.uid in request.resource.data.participants
+    && request.resource.data.recipientId in request.resource.data.participants
+    && get(/databases/$(database)/documents/conversations/$(request.resource.data.conversationId)).data.participants.toSet() == request.resource.data.participants.toSet()
+    && request.resource.data.text is string
+    && request.resource.data.text.size() > 0
+    && request.resource.data.text.size() <= 4000
+    && request.resource.data.sentAt == request.time;
+   allow update, delete: if false;
+  }
+  // Marketplace collections from the old Firebase implementation are inaccessible.
+ }
+}
