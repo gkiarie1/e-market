@@ -1,10 +1,13 @@
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const projectDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 // The API address is already the Windows LAN address reachable from the phone.
 try {
-  process.loadEnvFile('.env');
+  process.loadEnvFile(join(projectDir, '.env'));
 } catch (error) {
   if (error.code !== 'ENOENT') throw error;
 }
@@ -24,6 +27,7 @@ const extraArgs = process.argv.slice(2);
 // SDK 58 treats --offline as a hosting mode, so it cannot be combined with --lan.
 const hostArgs = extraArgs.includes('--offline') ? [] : ['--lan'];
 const child = spawn(process.execPath, [cli, 'start', ...hostArgs, '--clear', ...extraArgs], {
+  cwd: projectDir,
   stdio: 'inherit',
   env: { ...process.env, REACT_NATIVE_PACKAGER_HOSTNAME: hostname },
 });

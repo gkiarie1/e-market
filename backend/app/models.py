@@ -27,6 +27,7 @@ class User(Base):
     produce: Mapped[str] = mapped_column(String(300), default='')
     latitude: Mapped[float | None] = mapped_column(Float)
     longitude: Mapped[float | None] = mapped_column(Float)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     location_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         CheckConstraint("role IN ('buyer', 'farmer')"),
@@ -55,8 +56,21 @@ class Listing(Base):
     bulk: Mapped[bool]
     minimum: Mapped[int] = mapped_column(Integer, default=1)
     image: Mapped[str] = mapped_column(String(255))
+    wholesale_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    wholesale_minimum: Mapped[int] = mapped_column(Integer, default=1)
     farmer: Mapped[User] = relationship()
-    __table_args__ = (CheckConstraint('price > 0'), CheckConstraint('quantity >= 0'), CheckConstraint('minimum >= 1'))
+    __table_args__ = (CheckConstraint('price > 0'), CheckConstraint('quantity >= 0'), CheckConstraint('minimum >= 1'), CheckConstraint('wholesale_price IS NULL OR wholesale_price > 0', name='ck_wholesale_price'), CheckConstraint('wholesale_minimum >= 1', name='ck_wholesale_minimum'))
+
+
+class Notification(Base):
+    __tablename__ = 'notifications'
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey('users.id'), index=True)
+    title: Mapped[str] = mapped_column(String(120))
+    body: Mapped[str] = mapped_column(String(500))
+    order_id: Mapped[str] = mapped_column(ForeignKey('orders.id'))
+    date: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Photo(Base):
@@ -76,6 +90,7 @@ class Order(Base):
     date: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     payment: Mapped[str] = mapped_column(String(60))
     status: Mapped[str] = mapped_column(String(50), default='Awaiting seller confirmation')
+    buyer: Mapped[User] = relationship(foreign_keys=[buyer_id])
     items: Mapped[list['OrderItem']] = relationship(cascade='all, delete-orphan', lazy='selectin')
     __table_args__ = (UniqueConstraint('buyer_id', 'request_key', 'farmer_id'), CheckConstraint('total > 0'))
 
@@ -100,3 +115,16 @@ class Review(Base):
     text: Mapped[str] = mapped_column(String(2000))
     author: Mapped[User] = relationship(foreign_keys=[author_id])
     __table_args__ = (UniqueConstraint('author_id', 'farmer_id'), CheckConstraint('rating BETWEEN 1 AND 5'))
+
+
+class ChatRead(Base):
+    __tablename__ = 'chat_reads'
+    user_id: Mapped[str] = mapped_column(ForeignKey('users.id'), primary_key=True)
+    contact_id: Mapped[str] = mapped_column(ForeignKey('users.id'), primary_key=True)
+    date: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AccountCleanup(Base):
+    __tablename__ = 'account_cleanup'
+    user_id: Mapped[str] = mapped_column(ForeignKey('users.id'), primary_key=True)
+    photos: Mapped[list] = mapped_column(JSON)

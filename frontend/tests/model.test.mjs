@@ -12,3 +12,12 @@ test('empty app starts without fabricated accounts or listings',()=>{
  assert.equal(emptyState.orders.length,0);
  assert.equal(money(1000),'KSh 1,000');
 });
+
+test('wholesale pricing changes exactly at the minimum quantity',async()=>{
+ const {unitPrice}=await import('../src/model.ts');
+ const listing={price:120,minimum:1,wholesalePrice:85,wholesaleMinimum:10};
+ assert.equal(unitPrice(listing,9),120);
+ assert.equal(unitPrice(listing,10),85);
+ assert.equal(unitPrice(listing,11),85);
+ assert.equal(unitPrice({...listing,wholesalePrice:null},10),120);
+});

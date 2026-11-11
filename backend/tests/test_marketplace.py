@@ -209,3 +209,53 @@ def test_photo_reencoding_removes_exif(client):
     result=Image.open(BytesIO(output.content))
     assert not result.getexif()
     assert result.size==(20,10)
+
+
+def test_wholesale_notifications_and_read_privacy(client):
+    farmer, fp, _ = account(client, 'farmer')
+    buyer, bp, _ = account(client)
+    stranger, _, _ = account(client)
+    original = listing(client, farmer, quantity=100, price=120)
+    from app.db import SessionLocal
+    from app.models import Listing
+    with SessionLocal() as db:
+        image = db.get(Listing, original['id']).image
+    payload = {'name':'Wholesale avocados','price':120,'quantity':100,'unit':'kg','image':image,'wholesale_price':85,'wholesale_minimum':10}
+    published = client.post('/listings', headers=farmer, json=payload)
+    assert published.status_code == 201, published.text
+    item = published.json()
+    assert item['wholesalePrice'] == 85 and item['wholesaleMinimum'] == 10 and not item['wholesaleOnly']
+    retail = checkout(client,buyer,[{'listingId':item['id'],'quantity':9}]).json()[0]
+    assert retail['total'] == 1080 and retail['items'][0]['unitPrice'] == 120
+    key = str(uuid4())
+    bulk = checkout(client,buyer,[{'listingId':item['id'],'quantity':10}],key).json()[0]
+    assert bulk['total'] == 850 and bulk['items'][0]['listing']['price'] == 85
+    assert bulk['items'][0]['unitPrice'] == 85
+    assert len(client.get('/notifications',headers=farmer).json()) == 2
+    checkout(client,buyer,[{'listingId':item['id'],'quantity':10}],key)
+    assert len(client.get('/notifications',headers=farmer).json()) == 2
+    notification = client.get('/notifications',headers=farmer).json()[0]
+    assert not notification['read']
+    assert client.get('/notifications',headers=stranger).json() == []
+    assert client.patch('/notifications/'+notification['id']+'/read',headers=stranger).status_code == 404
+    assert client.patch('/notifications/'+notification['id']+'/read',headers=farmer).status_code == 204
+    assert client.get('/notifications',headers=farmer).json()[0]['read']
+    assert client.patch('/orders/'+bulk['id'],headers=farmer,json={'status':'Confirmed'}).status_code == 200
+    assert client.get('/notifications',headers=buyer).json()[0]['title'] == 'Order confirmed'
+    payload.update(bulk=True,price=85,minimum=10)
+    only = client.post('/listings',headers=farmer,json=payload)
+    assert only.status_code == 201, only.text
+    assert only.json()['wholesaleOnly']
+    assert checkout(client,buyer,[{'listingId':only.json()['id'],'quantity':9}]).status_code == 409
+    assert checkout(client,buyer,[{'listingId':only.json()['id'],'quantity':10}]).json()[0]['total'] == 850
+    payload['wholesale_minimum'] = 101
+    assert client.post('/listings',headers=farmer,json=payload).status_code == 422
+    from datetime import datetime, timezone, timedelta
+    date = datetime.now(timezone.utc)
+    path = '/chat/reads/' + fp['id']
+    assert client.patch(path,headers=buyer,json={'date':date.isoformat()}).status_code == 204
+    assert client.patch(path,headers=buyer,json={'date':(date-timedelta(hours=1)).isoformat()}).status_code == 204
+    assert client.get('/chat/reads',headers=stranger).json() == {}
+    assert datetime.fromisoformat(client.get('/chat/reads',headers=buyer).json()[fp['id']]) == date
+    assert client.patch(path,headers=buyer,json={'date':(date+timedelta(days=1)).isoformat()}).status_code == 422
+    assert client.patch('/chat/reads/'+bp['id'],headers=buyer,json={'date':date.isoformat()}).status_code == 404

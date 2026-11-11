@@ -40,3 +40,27 @@ def ensure_conversation(user, recipient):
     except Exception as exc:
         raise HTTPException(503, 'Live chat is temporarily unavailable.') from exc
     return {'id': conversation_id, 'participants': ids}
+
+
+def delete_account_data(user_id):
+    if not settings().firebase_project_id:
+        return
+    app = firebase_app()
+    try:
+        auth.delete_user(user_id, app=app)
+    except auth.UserNotFoundError:
+        pass
+    client = firestore.client(app=app)
+    from google.cloud.firestore_v1.base_query import FieldFilter
+    # Remove membership first so no new messages can be added to these threads.
+    for name in ['conversations', 'messages']:
+        collection = client.collection(name)
+        query = collection.where(filter=FieldFilter('participants', 'array_contains', user_id)).limit(400)
+        while True:
+            docs = list(query.stream())
+            if not docs:
+                break
+            batch = client.batch()
+            for document in docs:
+                batch.delete(document.reference)
+            batch.commit()

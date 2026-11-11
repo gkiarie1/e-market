@@ -1,3 +1,5 @@
+import asyncio
+from contextlib import suppress
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from decimal import Decimal
@@ -17,10 +19,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from . import chat
+from .accounts import router as accounts_router
+from .account_cleanup import cleanup_loop
 from .config import settings
+from .profiles import profile_json
 from .db import database, engine
-from .models import User, AuthSession, Listing, Photo, Order, OrderItem, Review, now
-from .schemas import Register, Login, ListingInput, LocationUpdate, Checkout, ReviewInput, ConversationInput, StatusInput
+from .models import User, AuthSession, Listing, Photo, Order, OrderItem, Review, Notification, ChatRead, now
+from .schemas import Register, Login, ListingInput, LocationUpdate, Checkout, ReviewInput, ConversationInput, StatusInput, ChatReadInput
 from .security import passwords, dummy_hash, current_user, create_session, bearer, token_hash
 
 config = settings()
@@ -32,18 +37,21 @@ Image.MAX_IMAGE_PIXELS = 20_000_000
 @asynccontextmanager
 async def lifespan(app):
     # Schema changes are explicit Alembic migrations, never implicit startup mutations.
-    yield
-    engine.dispose()
+    worker = asyncio.create_task(cleanup_loop())
+    try:
+        yield
+    finally:
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
+        engine.dispose()
 
 
 app = FastAPI(title='Shamba Market API', version='1.0.0', lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=config.cors_origins.split(','), allow_methods=['GET', 'POST', 'PATCH', 'DELETE'], allow_headers=['Authorization', 'Content-Type'])
+app.include_router(accounts_router)
 app.mount('/uploads', StaticFiles(directory=uploads), name='uploads')
 
-
-def profile_json(user):
-    return {'id': user.id, 'name': user.name, 'role': user.role, 'phone': user.phone, 'alternate': user.alternate, 'area': user.area, 'produce': user.produce,
-            **({'latitude': user.latitude, 'longitude': user.longitude} if user.latitude is not None else {})}
 
 
 def listing_json(listing, distance_km=None, average=0, purchased=0):
@@ -51,7 +59,7 @@ def listing_json(listing, distance_km=None, average=0, purchased=0):
     result = {'id': listing.id, 'farmerId': farmer.id, 'seller': farmer.name, 'name': listing.name, 'area': farmer.area,
               'phone': farmer.phone, 'alternate': farmer.alternate, 'price': float(listing.price), 'quantity': listing.quantity,
               'unit': listing.unit, 'bulk': listing.bulk, 'minimum': listing.minimum, 'image': config.public_base_url.rstrip('/') + listing.image,
-              'emoji': '🌱', 'rating': float(average or 0), 'purchaseCount': int(purchased or 0)}
+              'wholesalePrice': float(listing.wholesale_price) if listing.wholesale_price is not None else None, 'wholesaleMinimum': listing.wholesale_minimum, 'wholesaleOnly': listing.bulk, 'emoji': '🌱', 'rating': float(average or 0), 'purchaseCount': int(purchased or 0)}
     # Exact farm coordinates never leave the server in public listings.
     if distance_km is not None:
         result['distanceKm'] = math.ceil(distance_km)
@@ -59,7 +67,7 @@ def listing_json(listing, distance_km=None, average=0, purchased=0):
 
 
 def order_json(order):
-    return {'id': order.id, 'buyerId': order.buyer_id, 'items': [{'listing': item.snapshot, 'quantity': item.quantity} for item in order.items],
+    return {'id': order.id, 'buyerId': order.buyer_id, 'buyerName': order.buyer.name, 'items': [{'listing': item.snapshot, 'quantity': item.quantity, 'unitPrice': float(item.price)} for item in order.items],
             'total': float(order.total), 'date': order.date.isoformat(), 'payment': order.payment, 'status': order.status}
 
 
@@ -71,7 +79,7 @@ def farmer_only(user):
 @app.get('/health')
 def health(db: Session = Depends(database)):
     db.execute(select(1))
-    return {'status': 'ok'}
+    return {'status': 'ok', 'apiVersion': 3}
 
 
 @app.post('/auth/register', status_code=201)
@@ -93,7 +101,7 @@ def register(data: Register, db: Session = Depends(database)):
 def login(data: Login, db: Session = Depends(database)):
     user = db.scalar(select(User).where(User.email == str(data.email).lower()))
     valid = passwords.verify(data.password, user.password_hash if user else dummy_hash)
-    if not user or not valid:
+    if not user or user.deleted_at is not None or not valid:
         raise HTTPException(401, 'Email or password is incorrect.')
     return {'token': create_session(db, user), 'profile': profile_json(user)}
 
@@ -180,7 +188,7 @@ def listings(q: str = Query(default='', max_length=120), sort: str = Query(defau
     if mine:
         statement = statement.where(Listing.farmer_id == user.id)
     else:
-        statement = statement.where(Listing.quantity > 0)
+        statement = statement.where(Listing.quantity >= Listing.minimum)
     if q:
         statement = statement.where(or_(Listing.name.icontains(q, autoescape=True), User.name.icontains(q, autoescape=True), User.area.icontains(q, autoescape=True)))
     if km is not None:
@@ -194,7 +202,7 @@ def listings(q: str = Query(default='', max_length=120), sort: str = Query(defau
 
 @app.get('/orders')
 def orders(user: User = Depends(current_user), db: Session = Depends(database)):
-    records = db.scalars(select(Order).where(or_(Order.buyer_id == user.id, Order.farmer_id == user.id)).order_by(Order.date.desc()).limit(200)).all()
+    records = db.scalars(select(Order).options(joinedload(Order.buyer)).where(or_(Order.buyer_id == user.id, Order.farmer_id == user.id)).order_by(Order.date.desc()).limit(200)).all()
     return [order_json(order) for order in records]
 
 
@@ -213,6 +221,10 @@ def checkout(data: Checkout, user: User = Depends(current_user), db: Session = D
             raise HTTPException(409, 'Checkout key was already used for another basket.')
         return [order_json(order) for order in previous]
     requested = {item.listingId: item.quantity for item in data.items}
+    farmer_ids = select(Listing.farmer_id).where(Listing.id.in_(sorted(requested)))
+    farmers = db.scalars(select(User).where(User.id.in_(farmer_ids)).order_by(User.id).with_for_update(read=True)).all()
+    if any(farmer.deleted_at is not None for farmer in farmers):
+        raise HTTPException(409, 'A seller is no longer available.')
     rows = db.scalars(select(Listing).where(Listing.id.in_(sorted(requested))).order_by(Listing.id).with_for_update()).all()
     if len(rows) != len(requested):
         raise HTTPException(409, 'Some produce is no longer available.')
@@ -225,12 +237,15 @@ def checkout(data: Checkout, user: User = Depends(current_user), db: Session = D
     created = []
     for farmer_id, items in groups.items():
         order = Order(buyer_id=user.id, farmer_id=farmer_id, request_key=data.requestKey, payment=data.payment,
-                      total=sum((listing.price * amount for listing, amount in items), Decimal(0)))
-        order.items = [OrderItem(listing_id=listing.id, quantity=amount, price=listing.price, snapshot=listing_json(listing)) for listing, amount in items]
+                      total=sum((unit_price(listing, amount) * amount for listing, amount in items), Decimal(0)))
+        order.items = [OrderItem(listing_id=listing.id, quantity=amount, price=unit_price(listing, amount), snapshot={**listing_json(listing), "price": float(unit_price(listing, amount))}) for listing, amount in items]
         for listing, amount in items:
             listing.quantity -= amount
         db.add(order)
         created.append(order)
+        db.flush()
+        db.add(Notification(user_id=farmer_id, order_id=order.id, title='New order request', body=f'{user.name} requested produce worth KSh {order.total:,.2f}.'))
+        db.add(Notification(user_id=user.id, order_id=order.id, title='Order request sent', body='Your produce is reserved. Arrange collection and payment with the farmer.'))
     db.commit()
     return [order_json(order) for order in created]
 
@@ -252,6 +267,8 @@ def order_status(order_id: str, data: StatusInput, user: User = Depends(current_
         for listing in rows:
             listing.quantity += quantities[listing.id]
     order.status = data.status
+    recipient = order.buyer_id if user.id == order.farmer_id else order.farmer_id
+    db.add(Notification(user_id=recipient, order_id=order.id, title=f'Order {data.status.lower()}', body=f'{user.name} updated your order to {data.status.lower()}.'))
     db.commit()
     return order_json(order)
 
@@ -264,7 +281,7 @@ def reviews(user: User = Depends(current_user), db: Session = Depends(database))
 @app.post('/reviews')
 def review(data: ReviewInput, user: User = Depends(current_user), db: Session = Depends(database)):
     farmer = db.get(User, data.farmerId)
-    if user.role != 'buyer' or not farmer or farmer.role != 'farmer':
+    if user.role != 'buyer' or not farmer or farmer.deleted_at is not None or farmer.role != 'farmer':
         raise HTTPException(403, 'Buyers may review farmer accounts.')
     review = db.scalar(select(Review).where(Review.author_id == user.id, Review.farmer_id == farmer.id))
     if not review:
@@ -300,7 +317,42 @@ def chat_token(user: User = Depends(current_user), credentials=Depends(bearer), 
 
 @app.post('/chat/conversations')
 def conversation(data: ConversationInput, user: User = Depends(current_user), db: Session = Depends(database)):
-    recipient = db.get(User, data.recipientId)
-    if not recipient or recipient.id == user.id or recipient.role == user.role:
+    recipient = db.scalar(select(User).where(User.id == data.recipientId).with_for_update(read=True))
+    if not recipient or recipient.deleted_at is not None or recipient.id == user.id or recipient.role == user.role:
         raise HTTPException(404, 'Choose a buyer or farmer account to chat with.')
     return chat.ensure_conversation(user, recipient)
+
+
+def unit_price(listing, quantity):
+    return listing.wholesale_price if listing.wholesale_price is not None and quantity >= listing.wholesale_minimum else listing.price
+
+
+@app.get('/notifications')
+def notifications(user: User = Depends(current_user), db: Session = Depends(database)):
+    rows = db.scalars(select(Notification).where(Notification.user_id == user.id).order_by(Notification.date.desc()).limit(200)).all()
+    return [{'id': n.id, 'title': n.title, 'body': n.body, 'orderId': n.order_id, 'date': n.date.isoformat(), 'read': n.read_at is not None} for n in rows]
+
+
+@app.patch('/notifications/{notification_id}/read', status_code=204)
+def read_notification(notification_id: str, user: User = Depends(current_user), db: Session = Depends(database)):
+    entry = db.scalar(select(Notification).where(Notification.id == notification_id, Notification.user_id == user.id))
+    if not entry:
+        raise HTTPException(404, 'Notification not found.')
+    entry.read_at = now()
+    db.commit()
+
+
+@app.get('/chat/reads')
+def chat_reads(user: User = Depends(current_user), db: Session = Depends(database)):
+    return {r.contact_id: r.date.isoformat() for r in db.scalars(select(ChatRead).where(ChatRead.user_id == user.id))}
+
+
+@app.patch('/chat/reads/{contact_id}', status_code=204)
+def mark_chat_read(contact_id: str, data: ChatReadInput, user: User = Depends(current_user), db: Session = Depends(database)):
+    from sqlalchemy.dialects.postgresql import insert
+    recipient = db.get(User, contact_id)
+    if not recipient or recipient.deleted_at is not None or recipient.role == user.role:
+        raise HTTPException(404, 'Contact not found.')
+    statement = insert(ChatRead).values(user_id=user.id, contact_id=contact_id, date=data.date)
+    db.execute(statement.on_conflict_do_update(index_elements=['user_id', 'contact_id'], set_={'date': func.greatest(ChatRead.date, data.date)}))
+    db.commit()

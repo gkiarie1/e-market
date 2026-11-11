@@ -1,6 +1,7 @@
-from typing import Literal
+from datetime import datetime, timezone
+from typing import Annotated, Literal
 from decimal import Decimal
-from pydantic import BaseModel, EmailStr, Field, ConfigDict, model_validator
+from pydantic import BaseModel, EmailStr, Field, ConfigDict, StringConstraints, model_validator
 
 
 class Input(BaseModel):
@@ -19,7 +20,7 @@ class LocationUpdate(Coordinates):
 
 class Register(Input):
     email: EmailStr
-    password: str = Field(min_length=10, max_length=128)
+    password: Annotated[str, StringConstraints(strip_whitespace=False)] = Field(min_length=10, max_length=128)
     name: str = Field(min_length=1, max_length=100)
     role: Literal['buyer', 'farmer']
     phone: str = Field(min_length=7, max_length=30)
@@ -41,7 +42,7 @@ class Register(Input):
 
 class Login(Input):
     email: EmailStr
-    password: str = Field(min_length=1, max_length=128)
+    password: Annotated[str, StringConstraints(strip_whitespace=False)] = Field(min_length=1, max_length=128)
 
 
 class ListingInput(Input):
@@ -52,11 +53,21 @@ class ListingInput(Input):
     bulk: bool = False
     minimum: int = Field(default=1, ge=1, strict=True)
     image: str = Field(min_length=1, max_length=255)
+    wholesale_price: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=2)
+    wholesale_minimum: int = Field(default=1, ge=1, strict=True)
 
     @model_validator(mode='after')
     def validate_minimum(self):
         if self.minimum > self.quantity or (not self.bulk and self.minimum != 1):
             raise ValueError('Minimum must fit available stock; retail minimum is 1.')
+        if self.bulk and self.wholesale_price is None:
+            self.wholesale_price = self.price
+            self.wholesale_minimum = self.minimum
+        if self.wholesale_price is not None:
+            if self.wholesale_minimum > self.quantity:
+                raise ValueError('Wholesale minimum must fit available stock.')
+            if self.bulk and (self.minimum != self.wholesale_minimum or self.price != self.wholesale_price):
+                raise ValueError('Wholesale-only price and minimum must match wholesale settings.')
         return self
 
 
@@ -89,3 +100,39 @@ class ConversationInput(Input):
 
 class StatusInput(Input):
     status: Literal['Confirmed', 'Completed', 'Cancelled']
+
+
+class ChatReadInput(Input):
+    date: datetime
+
+    @model_validator(mode='after')
+    def valid_date(self):
+        if self.date.tzinfo is None or self.date > datetime.now(timezone.utc):
+            raise ValueError('Read timestamp must be timezone aware and not in the future.')
+        return self
+
+
+class ProfileUpdate(Input):
+    name: str = Field(min_length=1, max_length=100)
+    phone: str = Field(min_length=7, max_length=30)
+    alternate: str = Field(default='', max_length=30)
+    area: str = Field(min_length=1, max_length=100)
+    produce: str = Field(default='', max_length=300)
+
+
+class PasswordChange(Input):
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=False)
+    currentPassword: str = Field(min_length=1, max_length=128)
+    newPassword: str = Field(min_length=10, max_length=128)
+
+    @model_validator(mode='after')
+    def changed(self):
+        if self.newPassword == self.currentPassword:
+            raise ValueError('Choose a different password.')
+        return self
+
+
+class DeleteAccount(Input):
+    model_config = ConfigDict(extra='forbid', str_strip_whitespace=False)
+    password: Annotated[str, StringConstraints(strip_whitespace=False)] = Field(min_length=1, max_length=128)
+    confirmation: Literal['DELETE']
